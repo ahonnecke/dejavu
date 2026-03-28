@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+dejavu — Claude Code session autopsy tool.
+
+Parses Claude Code JSONL session files to surface repeated commands,
+re-read files, exploratory search patterns, and other signals that
+indicate tooling gaps or documentation needs.
+
+Usage:
+  dejavu                          # Analyze latest session in current project
+  dejavu <session.jsonl>          # Analyze specific session file
+  dejavu --project <path>         # Analyze latest session for a project dir
+  dejavu --all                    # Analyze all sessions in current project
+  dejavu --list                   # List available sessions for current project
+  dejavu --recent [N]             # Analyze N most recent sessions (default: 5)
+  dejavu --threshold N            # Minimum repeat count to report (default: 2)
+  dejavu --json                   # Output as JSON instead of markdown
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+
+def project_key_from_path(project_path: str) -> str:
+    """Convert a filesystem path to Claude's project key format."""
+    return project_path.rstrip("/").replace("/", "-")
+
+
+def find_project_dir(project_path: str | None = None) -> Path | None:
+    """Find the Claude project directory for a given or current working dir."""
+    if project_path is None:
+        project_path = os.getcwd()
+
+    project_path = os.path.realpath(project_path)
+    key = project_key_from_path(project_path)
+
+    candidate = CLAUDE_DIR / key
+    if candidate.is_dir():
+        return candidate
+
+    # Try parent directories (for subdirectory invocations)
+    parts = project_path.split("/")
+    for i in range(len(parts), 1, -1):
+        partial = "/".join(parts[:i])
+        key = project_key_from_path(partial)
+        candidate = CLAUDE_DIR / key
+        if candidate.is_dir():
+            return candidate
+
+    return None
+
+
+def list_sessions(project_dir: Path) -> list[Path]:
+    """List all JSONL session files in a project dir, newest first."""
+    sessions = list(project_dir.glob("*.jsonl"))
+    sessions.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return sessions
+
+
+def parse_session(path: Path) -> dict:
+    """Parse a JSONL session file into structured data."""
+    tool_uses = []
+    session_meta = {}
+
+    with open(path) as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Grab session metadata from first record
+            if not session_meta:
+                for key in ("sessionId", "version", "gitBranch", "cwd"):
+                    if key in obj:
+                        session_meta[key] = obj[key]
+
+            if obj.get("type") == "assistant":
+                msg = obj.get("message", obj)
+                ts = obj.get("timestamp")
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_uses.append({
+                            "tool": block["name"],
+                            "input": block.get("input", {}),
+                            "id": block.get("id", ""),
+                            "timestamp": ts,
+                        })
+
+    return {"meta": session_meta, "tool_uses": tool_uses, "path": str(path)}
+
+
+def analyze_session(parsed: dict, threshold: int = 2) -> dict:
+    """Analyze a parsed session for patterns."""
+    tool_uses = parsed["tool_uses"]
+
+    # --- Tool usage counts ---
+    tool_counts = Counter(tu["tool"] for tu in tool_uses)
+
+    # --- Bash command analysis ---
+    bash_commands = []
+    for tu in tool_uses:
+        if tu["tool"] == "Bash":
+            cmd = tu["input"].get("command", "")
+            bash_commands.append(cmd)
+
+    # Normalize bash commands for dedup (strip trailing whitespace, collapse runs)
+    def normalize_cmd(cmd: str) -> str:
+        # Strip UUIDs, timestamps, temp paths for grouping
+        import re
+        cmd = cmd.strip()
+        # Collapse UUID-like strings
+        cmd = re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "<UUID>", cmd
+        )
+        return cmd
+
+    bash_normalized = [normalize_cmd(c) for c in bash_commands]
+    bash_counts = Counter(bash_normalized)
+    repeated_bash = {
+        cmd: count for cmd, count in bash_counts.most_common()
+        if count >= threshold
+    }
+
+    # --- Read file analysis ---
+    read_files = []
+    for tu in tool_uses:
+        if tu["tool"] == "Read":
+            fp = tu["input"].get("file_path", "")
+            read_files.append(fp)
+
+    read_counts = Counter(read_files)
+    repeated_reads = {
+        fp: count for fp, count in read_counts.most_common()
+        if count >= threshold
+    }
+
+    # --- Grep pattern analysis ---
+    grep_patterns = []
+    for tu in tool_uses:
+        if tu["tool"] == "Grep":
+            pat = tu["input"].get("pattern", "")
+            grep_patterns.append(pat)
+
+    grep_counts = Counter(grep_patterns)
+    repeated_greps = {
+        pat: count for pat, count in grep_counts.most_common()
+        if count >= threshold
+    }
+
+    # --- Glob pattern analysis ---
+    glob_patterns = []
+    for tu in tool_uses:
+        if tu["tool"] == "Glob":
+            pat = tu["input"].get("pattern", "")
+            glob_patterns.append(pat)
+
+    glob_counts = Counter(glob_patterns)
+    repeated_globs = {
+        pat: count for pat, count in glob_counts.most_common()
+        if count >= threshold
+    }
+
+    # --- Edit file analysis ---
+    edit_files = []
+    for tu in tool_uses:
+        if tu["tool"] == "Edit":
+            fp = tu["input"].get("file_path", "")
+            edit_files.append(fp)
+
+    edit_counts = Counter(edit_files)
+
+    # --- Write file analysis ---
+    write_files = []
+    for tu in tool_uses:
+        if tu["tool"] == "Write":
+            fp = tu["input"].get("file_path", "")
+            write_files.append(fp)
+
+    # --- Exploratory sequence detection ---
+    # Find clusters of search tools (Grep, Glob, Read) without intervening edits
+    exploration_runs = []
+    current_run = []
+    for tu in tool_uses:
+        if tu["tool"] in ("Grep", "Glob", "Read"):
+            current_run.append(tu)
+        elif tu["tool"] in ("Edit", "Write", "Bash"):
+            if len(current_run) >= 3:
+                exploration_runs.append(current_run)
+            current_run = []
+    if len(current_run) >= 3:
+        exploration_runs.append(current_run)
+
+    # --- Files touched (read + edited + written) ---
+    files_read_only = set(read_files) - set(edit_files) - set(write_files)
+    files_modified = set(edit_files) | set(write_files)
+
+    return {
+        "meta": parsed["meta"],
+        "path": parsed["path"],
+        "total_tool_uses": len(tool_uses),
+        "tool_counts": dict(tool_counts.most_common()),
+        "repeated_bash": repeated_bash,
+        "repeated_reads": repeated_reads,
+        "repeated_greps": repeated_greps,
+        "repeated_globs": repeated_globs,
+        "all_bash": bash_commands,
+        "all_greps": grep_patterns,
+        "all_reads": read_files,
+        "edit_counts": dict(edit_counts.most_common()),
+        "files_read_only": sorted(files_read_only),
+        "files_modified": sorted(files_modified),
+        "exploration_runs": len(exploration_runs),
+        "exploration_lengths": [len(r) for r in exploration_runs],
+        "unique_bash": len(set(bash_normalized)),
+        "unique_reads": len(set(read_files)),
+        "unique_greps": len(set(grep_patterns)),
+    }
+
+
+def shorten_path(p: str, cwd: str = "") -> str:
+    """Shorten a path relative to cwd or home."""
+    if cwd and p.startswith(cwd):
+        return p[len(cwd):].lstrip("/")
+    home = str(Path.home())
+    if p.startswith(home):
+        return "~" + p[len(home):]
+    return p
+
+
+def format_markdown(analysis: dict) -> str:
+    """Format analysis results as markdown."""
+    meta = analysis["meta"]
+    cwd = meta.get("cwd", "")
+    lines = []
+
+    branch = meta.get("gitBranch", "unknown")
+    session_id = meta.get("sessionId", "unknown")
+    lines.append(f"# Session Analysis: {branch}")
+    lines.append(f"")
+    lines.append(f"**Session**: `{session_id}`")
+    lines.append(f"**File**: `{shorten_path(analysis['path'])}`")
+    lines.append(f"**Total tool uses**: {analysis['total_tool_uses']}")
+    lines.append(f"")
+
+    # Tool usage table
+    lines.append("## Tool Usage")
+    lines.append("")
+    lines.append("| Tool | Count | Unique |")
+    lines.append("|------|-------|--------|")
+    for tool, count in analysis["tool_counts"].items():
+        unique = {
+            "Bash": analysis["unique_bash"],
+            "Read": analysis["unique_reads"],
+            "Grep": analysis["unique_greps"],
+        }.get(tool, "")
+        lines.append(f"| {tool} | {count} | {unique} |")
+    lines.append("")
+
+    # Repeated bash commands
+    if analysis["repeated_bash"]:
+        lines.append("## Repeated Bash Commands")
+        lines.append("")
+        lines.append("```")
+        for cmd, count in sorted(analysis["repeated_bash"].items(), key=lambda x: -x[1]):
+            short = cmd[:120] + ("..." if len(cmd) > 120 else "")
+            lines.append(f"{count}x | {short}")
+        lines.append("```")
+        lines.append("")
+
+    # Repeated file reads
+    if analysis["repeated_reads"]:
+        lines.append("## Repeatedly Read Files")
+        lines.append("")
+        lines.append("```")
+        for fp, count in sorted(analysis["repeated_reads"].items(), key=lambda x: -x[1]):
+            lines.append(f"{count}x | {shorten_path(fp, cwd)}")
+        lines.append("```")
+        lines.append("")
+
+    # Repeated grep patterns
+    if analysis["repeated_greps"]:
+        lines.append("## Repeated Grep Patterns")
+        lines.append("")
+        lines.append("```")
+        for pat, count in sorted(analysis["repeated_greps"].items(), key=lambda x: -x[1]):
+            lines.append(f"{count}x | {pat}")
+        lines.append("```")
+        lines.append("")
+
+    # All unique grep patterns (even if not repeated — useful for understanding exploration)
+    if analysis["all_greps"]:
+        lines.append("## All Grep Patterns")
+        lines.append("")
+        lines.append("```")
+        seen = set()
+        for pat in analysis["all_greps"]:
+            if pat not in seen:
+                seen.add(pat)
+                lines.append(f"  {pat}")
+        lines.append("```")
+        lines.append("")
+
+    # Exploration runs
+    if analysis["exploration_runs"] > 0:
+        lines.append("## Exploration Sequences")
+        lines.append("")
+        lines.append(
+            f"Found **{analysis['exploration_runs']}** exploration run(s) "
+            f"(3+ consecutive search/read tools without edits)."
+        )
+        lines.append(f"Lengths: {analysis['exploration_lengths']}")
+        lines.append("")
+
+    # Files summary
+    if analysis["files_modified"]:
+        lines.append("## Files Modified")
+        lines.append("")
+        for fp in analysis["files_modified"]:
+            count = analysis["edit_counts"].get(fp, 0)
+            suffix = f" ({count} edits)" if count > 1 else ""
+            lines.append(f"- `{shorten_path(fp, cwd)}`{suffix}")
+        lines.append("")
+
+    if analysis["files_read_only"]:
+        lines.append("## Files Read (not modified)")
+        lines.append("")
+        for fp in analysis["files_read_only"]:
+            lines.append(f"- `{shorten_path(fp, cwd)}`")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_json(analysis: dict) -> str:
+    """Format analysis results as JSON."""
+    return json.dumps(analysis, indent=2, default=str)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="dejavu",
+        description="Claude Code session autopsy — find repeated patterns and tooling gaps.",
+    )
+    parser.add_argument(
+        "session_file",
+        nargs="?",
+        help="Path to a specific .jsonl session file",
+    )
+    parser.add_argument(
+        "--project", "-p",
+        help="Project directory path (default: current directory)",
+    )
+    parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="Analyze all sessions for the project",
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List available sessions",
+    )
+    parser.add_argument(
+        "--recent", "-r",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="N",
+        help="Analyze N most recent sessions (default: 5)",
+    )
+    parser.add_argument(
+        "--threshold", "-t",
+        type=int,
+        default=2,
+        help="Minimum repeat count to report (default: 2)",
+    )
+    parser.add_argument(
+        "--json", "-j",
+        action="store_true",
+        help="Output as JSON",
+    )
+
+    args = parser.parse_args()
+
+    # Direct file mode
+    if args.session_file:
+        path = Path(args.session_file)
+        if not path.exists():
+            print(f"File not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        parsed = parse_session(path)
+        analysis = analyze_session(parsed, args.threshold)
+        print(format_json(analysis) if args.json else format_markdown(analysis))
+        return
+
+    # Project mode
+    project_dir = find_project_dir(args.project)
+    if not project_dir:
+        target = args.project or os.getcwd()
+        print(f"No Claude sessions found for: {target}", file=sys.stderr)
+        print(f"Looked in: {CLAUDE_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions = list_sessions(project_dir)
+    if not sessions:
+        print(f"No session files found in: {project_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # List mode
+    if args.list:
+        print(f"Sessions for {project_dir.name}:\n")
+        for i, s in enumerate(sessions):
+            mtime = datetime.fromtimestamp(s.stat().st_mtime)
+            size_kb = s.stat().st_size / 1024
+            # Quick parse for branch name
+            branch = "?"
+            with open(s) as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        if "gitBranch" in obj:
+                            branch = obj["gitBranch"]
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            marker = " (latest)" if i == 0 else ""
+            print(f"  {mtime:%Y-%m-%d %H:%M}  {size_kb:6.0f}K  {branch}{marker}")
+            print(f"    {s.name}")
+        return
+
+    # Determine which sessions to analyze
+    if args.all:
+        targets = sessions
+    elif args.recent:
+        targets = sessions[: args.recent]
+    else:
+        targets = [sessions[0]]
+
+    # Analyze
+    for i, session_path in enumerate(targets):
+        if i > 0:
+            print("\n---\n")
+        parsed = parse_session(session_path)
+        analysis = analyze_session(parsed, args.threshold)
+        print(format_json(analysis) if args.json else format_markdown(analysis))
+
+
+if __name__ == "__main__":
+    main()
