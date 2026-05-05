@@ -5,11 +5,17 @@ files to surface repeated commands, re-read files, and exploration patterns,
 then recommends what to do about them: a CLAUDE.md addition, a hook, a wrapper
 script, or a doc note.
 
-Single-file Python 3, no dependencies.
+Single-module Python 3, no runtime dependencies.
 
-## Current
-Flesh out this project, makefile, build steps, prepare for pipy release, I want
-to add it to my portfolio so it needs to be rounded out
+## Install
+
+    pip install dejavu-claude
+
+This installs the `dejavu` command. Or run from a checkout:
+
+    git clone https://github.com/ahonnecke/dejavu
+    cd dejavu
+    python3 dejavu.py --help
 
 ## Usage
 

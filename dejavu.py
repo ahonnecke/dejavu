@@ -39,7 +39,7 @@ CLAUDE_DIR = Path.home() / ".claude" / "projects"
 HIGH_COST_BASH_PATTERNS = [
     re.compile(p)
     for p in [
-        r"\brm\s+-[rR]?[fF]\b",
+        r"\brm\s+-[rRfF]+\b",
         r"\bgit\s+push\b[^\n]*--force\b",
         r"\bgit\s+push\b[^\n]*\s-f\b",
         r"\bgit\s+reset\s+--hard\b",
@@ -74,15 +74,17 @@ def normalize_cmd(cmd: str) -> str:
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         "<UUID>", cmd
     )
-    # Strip trailing output-shaping pipes/redirects (repeatedly)
+    # Strip trailing output-shaping pipes/redirects (repeatedly).
+    # Order matters: handle 2>&1 and 2>/dev/null before bare >, so the bare >
+    # rule doesn't strip just `> /dev/null` from `foo 2> /dev/null`.
     prev = None
     while cmd != prev:
         prev = cmd
         cmd = re.sub(r"\s*\|\s*(?:head|tail)\s+-n\s*\d+\s*$", "", cmd)
         cmd = re.sub(r"\s*\|\s*(?:head|tail)\s+-\d+\s*$", "", cmd)
         cmd = re.sub(r"\s*2>&1\s*$", "", cmd)
-        cmd = re.sub(r"\s*>\s*/dev/null\s*$", "", cmd)
         cmd = re.sub(r"\s*2>\s*/dev/null\s*$", "", cmd)
+        cmd = re.sub(r"\s*>\s*/dev/null\s*$", "", cmd)
         cmd = cmd.strip()
     return cmd
 
