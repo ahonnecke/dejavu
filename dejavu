@@ -15,11 +15,14 @@ Usage:
   dejavu --recent [N]             # Analyze N most recent sessions (default: 5)
   dejavu --threshold N            # Minimum repeat count to report (default: 2)
   dejavu --json                   # Output as JSON instead of markdown
+  dejavu --recommend              # Emit only actionable recommendations
+  dejavu --self-eval              # Cross-project recommendations from full history
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -27,6 +30,72 @@ from pathlib import Path
 
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+
+# --- Heuristic tables (in-code; tune freely) ---
+
+# Bash patterns where a single violation is expensive enough that we
+# recommend a hook regardless of frequency. Compiled once at import.
+HIGH_COST_BASH_PATTERNS = [
+    re.compile(p)
+    for p in [
+        r"\brm\s+-[rR]?[fF]\b",
+        r"\bgit\s+push\b[^\n]*--force\b",
+        r"\bgit\s+push\b[^\n]*\s-f\b",
+        r"\bgit\s+reset\s+--hard\b",
+        r"\bgit\s+checkout\s+\.\s*$",
+        r"\bgit\s+clean\s+-[fF]d?\b",
+        r"\bgit\s+branch\s+-D\b",
+        r"\bcurl\b[^|]*\|\s*(?:ba)?sh\b",
+        r"\bwget\b[^|]*\|\s*(?:ba)?sh\b",
+        r"--no-verify\b",
+        r"\bchmod\s+-R\b",
+        r"\bdropdb\b",
+        r"\bDROP\s+TABLE\b",
+        r"\bTRUNCATE\s+TABLE\b",
+        r"\bDELETE\s+FROM\b",
+    ]
+]
+
+
+def is_high_cost_bash(cmd: str) -> bool:
+    return any(p.search(cmd) for p in HIGH_COST_BASH_PATTERNS)
+
+
+def normalize_cmd(cmd: str) -> str:
+    """Normalize a bash command for grouping.
+
+    Collapses UUIDs, strips trailing output-shaping suffixes (| head -N, | tail -N,
+    2>&1 redirections). The point is to merge commands that differ only in how they
+    truncate output — the underlying intent is the same.
+    """
+    cmd = cmd.strip()
+    cmd = re.sub(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        "<UUID>", cmd
+    )
+    # Strip trailing output-shaping pipes/redirects (repeatedly)
+    prev = None
+    while cmd != prev:
+        prev = cmd
+        cmd = re.sub(r"\s*\|\s*(?:head|tail)\s+-n\s*\d+\s*$", "", cmd)
+        cmd = re.sub(r"\s*\|\s*(?:head|tail)\s+-\d+\s*$", "", cmd)
+        cmd = re.sub(r"\s*2>&1\s*$", "", cmd)
+        cmd = re.sub(r"\s*>\s*/dev/null\s*$", "", cmd)
+        cmd = re.sub(r"\s*2>\s*/dev/null\s*$", "", cmd)
+        cmd = cmd.strip()
+    return cmd
+
+
+def is_already_wrapped(cmd: str) -> bool:
+    """True if the command is an invocation of a user script (absolute path / ./).
+
+    These are already wrapped — recommending another wrapper is noise.
+    """
+    first = cmd.split(None, 1)[0] if cmd else ""
+    if not first:
+        return False
+    return first.startswith(("/", "./", "~/")) or "/bin/" in first
 
 
 def project_key_from_path(project_path: str) -> str:
@@ -111,18 +180,6 @@ def analyze_session(parsed: dict, threshold: int = 2) -> dict:
         if tu["tool"] == "Bash":
             cmd = tu["input"].get("command", "")
             bash_commands.append(cmd)
-
-    # Normalize bash commands for dedup (strip trailing whitespace, collapse runs)
-    def normalize_cmd(cmd: str) -> str:
-        # Strip UUIDs, timestamps, temp paths for grouping
-        import re
-        cmd = cmd.strip()
-        # Collapse UUID-like strings
-        cmd = re.sub(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            "<UUID>", cmd
-        )
-        return cmd
 
     bash_normalized = [normalize_cmd(c) for c in bash_commands]
     bash_counts = Counter(bash_normalized)
@@ -214,6 +271,7 @@ def analyze_session(parsed: dict, threshold: int = 2) -> dict:
         "repeated_greps": repeated_greps,
         "repeated_globs": repeated_globs,
         "all_bash": bash_commands,
+        "all_bash_normalized": bash_normalized,
         "all_greps": grep_patterns,
         "all_reads": read_files,
         "edit_counts": dict(edit_counts.most_common()),
@@ -225,6 +283,398 @@ def analyze_session(parsed: dict, threshold: int = 2) -> dict:
         "unique_reads": len(set(read_files)),
         "unique_greps": len(set(grep_patterns)),
     }
+
+
+# --- Recommendation engine ---
+
+def recommend_from_analysis(analysis: dict) -> list[dict]:
+    """Apply single-session heuristic rules. Returns sorted recommendations."""
+    recs = []
+    cwd = analysis["meta"].get("cwd", "")
+    tool_counts = analysis["tool_counts"]
+    reads = tool_counts.get("Read", 0)
+    edits = tool_counts.get("Edit", 0) + tool_counts.get("Write", 0)
+
+    # R1: high-cost bash, even count >= 2 is too many
+    for cmd, count in analysis["repeated_bash"].items():
+        if is_high_cost_bash(cmd):
+            recs.append({
+                "kind": "hook",
+                "target": cmd,
+                "reason": "high-blast-radius command — even one mistake is expensive",
+                "evidence": f"{count}x in this session",
+                "weight": count * 100,
+                "priority": 1,
+                "rule": "R1",
+            })
+
+    # R2: same bash command repeated a lot, not high-cost → wrapper candidate
+    for cmd, count in analysis["repeated_bash"].items():
+        if count >= 4 and not is_high_cost_bash(cmd) and not is_already_wrapped(cmd):
+            recs.append({
+                "kind": "wrapper",
+                "target": cmd,
+                "reason": "same command issued repeatedly in one session",
+                "evidence": f"{count}x in this session",
+                "weight": count,
+                "priority": 2,
+                "rule": "R2",
+            })
+
+    # R3: same file read >= 3 → CLAUDE.md pointer
+    for fp, count in analysis["repeated_reads"].items():
+        if count >= 3:
+            scope = "in-project" if cwd and fp.startswith(cwd) else "external"
+            recs.append({
+                "kind": "claudemd",
+                "target": fp,
+                "reason": (
+                    "load-bearing file repeatedly opened — "
+                    "reference its purpose in CLAUDE.md"
+                    if scope == "in-project"
+                    else "external file repeatedly loaded — "
+                    "context may be too large or duplicated"
+                ),
+                "evidence": f"{count}x in this session",
+                "weight": count,
+                "priority": 2,
+                "rule": "R3",
+            })
+
+    # R4: many exploration runs → docs gap
+    if analysis["exploration_runs"] >= 3:
+        recs.append({
+            "kind": "docs",
+            "target": "codebase navigation",
+            "reason": "multiple search/read sequences without edits suggest missing docs or codebase map",
+            "evidence": (
+                f"{analysis['exploration_runs']} exploration runs, "
+                f"lengths={analysis['exploration_lengths']}"
+            ),
+            "weight": analysis["exploration_runs"],
+            "priority": 2,
+            "rule": "R4",
+        })
+
+    # R5: read-heavy session
+    if reads >= 10 and edits >= 1 and reads / edits >= 5:
+        recs.append({
+            "kind": "docs",
+            "target": "codebase orientation",
+            "reason": "high read-to-edit ratio — exploration heavy",
+            "evidence": f"{reads} reads vs {edits} edits ({reads/edits:.1f}:1)",
+            "weight": int(reads / max(edits, 1)),
+            "priority": 3,
+            "rule": "R5",
+        })
+
+    # R6: grep thrashing
+    unique_greps = analysis["unique_greps"]
+    if unique_greps >= 8 and edits <= 2:
+        recs.append({
+            "kind": "codebase-map",
+            "target": "search strategy",
+            "reason": "many distinct grep patterns with few edits — symbols may be hard to locate",
+            "evidence": f"{unique_greps} unique patterns, {edits} edits",
+            "weight": unique_greps,
+            "priority": 2,
+            "rule": "R6",
+        })
+
+    return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
+
+
+def aggregate_analyses(analyses: list[dict]) -> dict:
+    """Merge analyses across sessions. Counts how many sessions each pattern appears in."""
+    bash_sessions = defaultdict(int)
+    bash_total = defaultdict(int)
+    read_sessions = defaultdict(int)
+    read_total = defaultdict(int)
+    grep_sessions = defaultdict(int)
+    grep_total = defaultdict(int)
+
+    for a in analyses:
+        seen = set()
+        for cmd in a.get("all_bash_normalized", []):
+            bash_total[cmd] += 1
+            if cmd not in seen:
+                bash_sessions[cmd] += 1
+                seen.add(cmd)
+
+        seen = set()
+        for fp in a.get("all_reads", []):
+            read_total[fp] += 1
+            if fp not in seen:
+                read_sessions[fp] += 1
+                seen.add(fp)
+
+        seen = set()
+        for pat in a.get("all_greps", []):
+            grep_total[pat] += 1
+            if pat not in seen:
+                grep_sessions[pat] += 1
+                seen.add(pat)
+
+    return {
+        "n_sessions": len(analyses),
+        "bash": {
+            cmd: {"sessions": bash_sessions[cmd], "total": bash_total[cmd]}
+            for cmd in bash_total
+        },
+        "reads": {
+            fp: {"sessions": read_sessions[fp], "total": read_total[fp]}
+            for fp in read_total
+        },
+        "greps": {
+            pat: {"sessions": grep_sessions[pat], "total": grep_total[pat]}
+            for pat in grep_total
+        },
+    }
+
+
+def recommend_from_aggregate(agg: dict, min_sessions: int | None = None) -> list[dict]:
+    """Apply cross-session heuristic rules.
+
+    `min_sessions`: how many sessions a pattern must appear in. If None, auto-scales:
+    n=2..4 → 2, n=10 → 3, n=100 → 10, n=400+ → 30.
+    """
+    recs = []
+    n = agg["n_sessions"]
+    if n < 2:
+        return recs
+
+    if min_sessions is None:
+        threshold_sessions = max(2, min(n // 4, 30))
+    else:
+        threshold_sessions = max(2, min_sessions)
+
+    # R7: bash recurring across sessions
+    for cmd, info in agg["bash"].items():
+        if info["sessions"] < threshold_sessions:
+            continue
+        evidence = f"{info['total']}x across {info['sessions']}/{n} sessions"
+        weight = info["sessions"] * 1000 + info["total"]
+        if is_high_cost_bash(cmd):
+            recs.append({
+                "kind": "hook",
+                "target": cmd,
+                "reason": "high-blast-radius command recurring across sessions",
+                "evidence": evidence,
+                "weight": weight + 100000,
+                "priority": 1,
+                "rule": "R7-hook",
+            })
+        elif not is_already_wrapped(cmd):
+            recs.append({
+                "kind": "wrapper",
+                "target": cmd,
+                "reason": "command recurs across sessions — wrapper or alias would amortize",
+                "evidence": evidence,
+                "weight": weight,
+                "priority": 2,
+                "rule": "R7-wrapper",
+            })
+
+    # R8: file reads recurring across sessions
+    for fp, info in agg["reads"].items():
+        if info["sessions"] < threshold_sessions:
+            continue
+        recs.append({
+            "kind": "claudemd",
+            "target": fp,
+            "reason": "file repeatedly loaded as context across sessions",
+            "evidence": f"{info['total']}x across {info['sessions']}/{n} sessions",
+            "weight": info["sessions"] * 1000 + info["total"],
+            "priority": 2,
+            "rule": "R8",
+        })
+
+    # R9: grep patterns recurring across sessions
+    for pat, info in agg["greps"].items():
+        if info["sessions"] < threshold_sessions:
+            continue
+        recs.append({
+            "kind": "claudemd",
+            "target": f"grep: {pat}",
+            "reason": "same search recurring across sessions — point at where it lives",
+            "evidence": f"{info['total']}x across {info['sessions']}/{n} sessions",
+            "weight": info["sessions"] * 1000 + info["total"],
+            "priority": 2,
+            "rule": "R9",
+        })
+
+    return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
+
+
+def cross_project_patterns(per_project_aggs: dict, min_sessions_per_project: int = 1) -> dict:
+    """Pivot per-project aggregates into a pattern-keyed cross-project view.
+
+    A pattern counts toward a project if it appears in >= min_sessions_per_project
+    sessions of that project. Default of 1 means "the pattern was used at all in
+    the project" — appropriate when many projects have ≤1 session each (e.g. branch
+    worktrees). The cross-project breadth threshold (min_projects) is the real filter.
+    """
+    bash_proj = defaultdict(set)
+    bash_total = defaultdict(int)
+    read_proj = defaultdict(set)
+    read_total = defaultdict(int)
+    grep_proj = defaultdict(set)
+    grep_total = defaultdict(int)
+
+    for proj, agg in per_project_aggs.items():
+        for cmd, info in agg["bash"].items():
+            if info["sessions"] >= min_sessions_per_project:
+                bash_proj[cmd].add(proj)
+                bash_total[cmd] += info["total"]
+        for fp, info in agg["reads"].items():
+            if info["sessions"] >= min_sessions_per_project:
+                read_proj[fp].add(proj)
+                read_total[fp] += info["total"]
+        for pat, info in agg["greps"].items():
+            if info["sessions"] >= min_sessions_per_project:
+                grep_proj[pat].add(proj)
+                grep_total[pat] += info["total"]
+
+    return {
+        "n_projects": len(per_project_aggs),
+        "bash": {
+            cmd: {"projects": sorted(bash_proj[cmd]), "total": bash_total[cmd]}
+            for cmd in bash_proj
+        },
+        "reads": {
+            fp: {"projects": sorted(read_proj[fp]), "total": read_total[fp]}
+            for fp in read_proj
+        },
+        "greps": {
+            pat: {"projects": sorted(grep_proj[pat]), "total": grep_total[pat]}
+            for pat in grep_proj
+        },
+    }
+
+
+def recommend_cross_project(cross: dict, min_projects: int | None = None) -> list[dict]:
+    """Apply cross-project rules X1-X4.
+
+    Patterns recurring across distinct projects suggest *global* changes
+    (~/.claude/CLAUDE.md, global wrapper, rtk addition) rather than per-project ones.
+    """
+    recs = []
+    n = cross["n_projects"]
+    if n < 2:
+        return recs
+
+    if min_projects is None:
+        # Auto: floor of 5 distinct projects, scaling up to 15 for huge corpora
+        min_projects = max(5, min(n // 20, 15))
+
+    for cmd, info in cross["bash"].items():
+        n_proj = len(info["projects"])
+        if n_proj < min_projects:
+            continue
+        evidence = f"{info['total']}x across {n_proj}/{n} projects"
+        weight = n_proj * 1000 + info["total"]
+        if is_high_cost_bash(cmd):
+            recs.append({
+                "kind": "hook",
+                "scope": "global",
+                "target": cmd,
+                "reason": "high-blast-radius command recurring across multiple projects",
+                "evidence": evidence,
+                "weight": weight + 100000,
+                "priority": 1,
+                "rule": "X1",
+            })
+        elif not is_already_wrapped(cmd):
+            recs.append({
+                "kind": "wrapper",
+                "scope": "global",
+                "target": cmd,
+                "reason": "command recurs across many projects — global alias / rtk addition",
+                "evidence": evidence,
+                "weight": weight,
+                "priority": 2,
+                "rule": "X2",
+            })
+
+    for fp, info in cross["reads"].items():
+        n_proj = len(info["projects"])
+        if n_proj < min_projects:
+            continue
+        recs.append({
+            "kind": "claudemd",
+            "scope": "global",
+            "target": fp,
+            "reason": "shared/external file repeatedly read across projects",
+            "evidence": f"{info['total']}x across {n_proj}/{n} projects",
+            "weight": n_proj * 1000 + info["total"],
+            "priority": 2,
+            "rule": "X3",
+        })
+
+    for pat, info in cross["greps"].items():
+        n_proj = len(info["projects"])
+        if n_proj < min_projects:
+            continue
+        recs.append({
+            "kind": "claudemd",
+            "scope": "global",
+            "target": f"grep: {pat}",
+            "reason": "same search recurring across many projects",
+            "evidence": f"{info['total']}x across {n_proj}/{n} projects",
+            "weight": n_proj * 1000 + info["total"],
+            "priority": 2,
+            "rule": "X4",
+        })
+
+    return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
+
+
+def format_recommendations(recs: list[dict], header: str = "", top: int = 10, heading_level: int = 2) -> str:
+    """Render recommendations as terse markdown.
+
+    `top`: cap the number of recommendations *per kind* (0 = no cap).
+    `heading_level`: markdown heading level for per-kind sections (default 2 = ##).
+    """
+    h = "#" * heading_level
+    if not recs:
+        return (header + "\n\n_No actionable recommendations._\n") if header else "_No actionable recommendations._\n"
+
+    lines = []
+    if header:
+        lines.append(header)
+        lines.append("")
+
+    by_kind = defaultdict(list)
+    for r in recs:
+        by_kind[r["kind"]].append(r)
+
+    kind_titles = {
+        "hook": "Hooks (priority 1)",
+        "wrapper": "Wrappers / aliases",
+        "claudemd": "CLAUDE.md additions",
+        "docs": "Documentation",
+        "codebase-map": "Codebase map",
+    }
+    kind_order = ["hook", "wrapper", "claudemd", "codebase-map", "docs"]
+
+    for kind in kind_order:
+        items = by_kind.get(kind)
+        if not items:
+            continue
+        truncated = top and len(items) > top
+        shown = items[:top] if top else items
+        suffix = f" (top {top} of {len(items)})" if truncated else ""
+        lines.append(f"{h} {kind_titles.get(kind, kind)}{suffix}")
+        lines.append("")
+        for r in shown:
+            target = r["target"]
+            if len(target) > 140:
+                target = target[:137] + "..."
+            lines.append(f"- `{target}` — {r['evidence']} _[{r['rule']}]_")
+            lines.append(f"  - {r['reason']}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def shorten_path(p: str, cwd: str = "") -> str:
@@ -389,8 +839,131 @@ def main():
         action="store_true",
         help="Output as JSON",
     )
+    parser.add_argument(
+        "--recommend",
+        action="store_true",
+        help="Emit only actionable recommendations (suppresses raw counts)",
+    )
+    parser.add_argument(
+        "--self-eval",
+        action="store_true",
+        help="Cross-project mode: aggregate all sessions across all projects in ~/.claude/projects",
+    )
+    parser.add_argument(
+        "--per-project-cap",
+        type=int,
+        default=20,
+        help="In --self-eval, cap most-recent sessions per project (default: 20)",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="Cap recommendations per kind (default: 10; 0 = no cap)",
+    )
+    parser.add_argument(
+        "--cross-min-projects",
+        type=int,
+        default=None,
+        help="In --self-eval, override min projects threshold for cross-project rules",
+    )
 
     args = parser.parse_args()
+
+    # --- Self-eval mode (per-project + cross-project) ---
+    if args.self_eval:
+        if not CLAUDE_DIR.is_dir():
+            print(f"No projects directory: {CLAUDE_DIR}", file=sys.stderr)
+            sys.exit(1)
+
+        # Group analyses by project
+        project_analyses: dict[str, list[dict]] = {}
+        total_sessions = 0
+        for pd in sorted(CLAUDE_DIR.iterdir()):
+            if not pd.is_dir():
+                continue
+            sessions = list_sessions(pd)
+            if not sessions:
+                continue
+            picked = sessions[: args.per_project_cap]
+            project_analyses[pd.name] = [
+                analyze_session(parse_session(s), args.threshold) for s in picked
+            ]
+            total_sessions += len(picked)
+
+        if not project_analyses:
+            print("No sessions found across projects.", file=sys.stderr)
+            sys.exit(1)
+
+        # Per-project aggregates and recommendations
+        per_project_aggs = {
+            proj: aggregate_analyses(analyses)
+            for proj, analyses in project_analyses.items()
+        }
+        per_project_recs = {
+            proj: recommend_from_aggregate(agg)
+            for proj, agg in per_project_aggs.items()
+        }
+
+        # Cross-project rollup
+        cross = cross_project_patterns(per_project_aggs)
+        cross_recs = recommend_cross_project(cross, min_projects=args.cross_min_projects)
+
+        # Per-project highlights: top rec per project, sorted by weight
+        highlights = []
+        for proj, recs in per_project_recs.items():
+            if recs:
+                highlights.append((proj, recs[0]))
+        highlights.sort(key=lambda t: -t[1].get("weight", 0))
+        highlight_cap = args.top if args.top else len(highlights)
+
+        if args.json:
+            print(json.dumps({
+                "n_sessions_analyzed": total_sessions,
+                "n_projects": len(project_analyses),
+                "cross_project_recommendations": cross_recs,
+                "per_project_highlights": [
+                    {"project": p, "top_recommendation": r}
+                    for p, r in highlights[:highlight_cap]
+                ],
+                "per_project_recommendations": {
+                    proj: recs for proj, recs in per_project_recs.items() if recs
+                },
+            }, indent=2, default=str))
+            return
+
+        header = (
+            f"# dejavu --self-eval\n\n"
+            f"**Projects analyzed**: {len(project_analyses)}  "
+            f"**Sessions analyzed**: {total_sessions}  "
+            f"(cap {args.per_project_cap}/project)\n"
+        )
+        out = [header, "## Cross-project patterns", ""]
+        if cross_recs:
+            out.append(format_recommendations(cross_recs, "", top=args.top, heading_level=3))
+        else:
+            out.append("_No cross-project patterns met threshold._\n")
+
+        out.append("## Per-project highlights")
+        out.append("")
+        if not highlights:
+            out.append("_No per-project recommendations._")
+        else:
+            shown = highlights[:highlight_cap]
+            for proj, rec in shown:
+                target = rec["target"]
+                if len(target) > 100:
+                    target = target[:97] + "..."
+                out.append(
+                    f"- **{proj}** → {rec['kind']}: `{target}` "
+                    f"({rec['evidence']}) _[{rec['rule']}]_"
+                )
+            if len(highlights) > highlight_cap:
+                out.append(f"")
+                out.append(f"_(showing top {highlight_cap} of {len(highlights)})_")
+        out.append("")
+        print("\n".join(out))
+        return
 
     # Direct file mode
     if args.session_file:
@@ -400,6 +973,14 @@ def main():
             sys.exit(1)
         parsed = parse_session(path)
         analysis = analyze_session(parsed, args.threshold)
+        if args.recommend:
+            recs = recommend_from_analysis(analysis)
+            if args.json:
+                print(json.dumps(recs, indent=2, default=str))
+            else:
+                header = f"# Recommendations: `{shorten_path(str(path))}`"
+                print(format_recommendations(recs, header, top=args.top))
+            return
         print(format_json(analysis) if args.json else format_markdown(analysis))
         return
 
@@ -446,12 +1027,35 @@ def main():
     else:
         targets = [sessions[0]]
 
+    # --recommend with multiple sessions: aggregate then recommend
+    if args.recommend and len(targets) > 1:
+        analyses = [analyze_session(parse_session(s), args.threshold) for s in targets]
+        agg = aggregate_analyses(analyses)
+        cross_recs = recommend_from_aggregate(agg)
+        if args.json:
+            print(json.dumps(cross_recs, indent=2, default=str))
+            return
+        header = (
+            f"# Recommendations: {project_dir.name}\n\n"
+            f"**Sessions analyzed**: {len(analyses)}\n"
+        )
+        print(format_recommendations(cross_recs, header, top=args.top))
+        return
+
     # Analyze
     for i, session_path in enumerate(targets):
         if i > 0:
             print("\n---\n")
         parsed = parse_session(session_path)
         analysis = analyze_session(parsed, args.threshold)
+        if args.recommend:
+            recs = recommend_from_analysis(analysis)
+            if args.json:
+                print(json.dumps(recs, indent=2, default=str))
+            else:
+                header = f"# Recommendations: `{shorten_path(str(session_path))}`"
+                print(format_recommendations(recs, header, top=args.top))
+            continue
         print(format_json(analysis) if args.json else format_markdown(analysis))
 
 
