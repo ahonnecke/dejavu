@@ -43,29 +43,43 @@ Useful flags:
 
 - **hook** — high-blast-radius command worth gating in `.claude/settings.json`
 - **wrapper** — repeated raw command that wants an alias / script / rtk addition
+- **skill** — recurring multi-step workflow worth packaging as a model-invokable Skill (`SKILL.md`) instead of a wrapper or CLAUDE.md rule
 - **claudemd** — file or symbol that should be referenced once in CLAUDE.md
 - **docs / codebase-map** — exploration patterns suggesting missing project docs
+
+### When to choose `skill` vs `wrapper` vs `claudemd` vs `hook`
+
+| Pattern shape | Right tool | Why |
+|---|---|---|
+| Same `Bash` command repeated | wrapper | shell-level efficiency; no model judgment needed |
+| Same file read or grep recurring | claudemd | one-line pointer is cheaper than re-derivation |
+| High-blast-radius command (any frequency) | hook | deterministic, mechanical enforcement |
+| Multi-step sequence (read→search→edit→verify) recurring | **skill** | needs judgment between steps; loaded on demand, not always |
+| Soft preference, violations cheap | claudemd | ~50-line attention budget |
+| Soft preference, violations expensive | hook | promote when CLAUDE.md is ignored |
 
 ## Rules
 
 ### Single-session (one `.jsonl`)
 
-| ID | Trigger                                                       | Recommendation       |
-|----|---------------------------------------------------------------|----------------------|
-| R1 | High-cost bash pattern, count ≥2                              | hook (priority 1)    |
-| R2 | Same bash command, count ≥4, not high-cost                    | wrapper              |
-| R3 | Same file read ≥3                                             | CLAUDE.md pointer    |
-| R4 | ≥3 exploration runs (≥3 search/read tools without an edit)    | docs / codebase map  |
-| R5 | Reads ≥10 and reads:edits ≥5                                  | docs (orientation)   |
-| R6 | Unique greps ≥8 and edits ≤2                                  | codebase map         |
+| ID  | Trigger                                                       | Recommendation       |
+|-----|---------------------------------------------------------------|----------------------|
+| R1  | High-cost bash pattern, count ≥2                              | hook (priority 1)    |
+| R2  | Same bash command, count ≥4, not high-cost                    | wrapper              |
+| R3  | Same file read ≥3                                             | CLAUDE.md pointer    |
+| R4  | ≥3 exploration runs (≥3 search/read tools without an edit)    | docs / codebase map  |
+| R5  | Reads ≥10 and reads:edits ≥5                                  | docs (orientation)   |
+| R6  | Unique greps ≥8 and edits ≤2                                  | codebase map         |
+| R10 | ≥15 tool uses, ≥4 distinct tool types, ≥2 exploration runs, ≥2 files modified | **skill** (workflow shape) |
 
 ### Cross-session (`--all --recommend`)
 
-| ID | Trigger                                          | Recommendation                     |
-|----|--------------------------------------------------|------------------------------------|
-| R7 | Bash command in ≥auto-threshold of sessions      | wrapper (or hook if high-cost)     |
-| R8 | File read in ≥auto-threshold of sessions         | CLAUDE.md pointer                  |
-| R9 | Grep pattern in ≥auto-threshold of sessions      | CLAUDE.md pointer                  |
+| ID        | Trigger                                          | Recommendation                     |
+|-----------|--------------------------------------------------|------------------------------------|
+| R7        | Bash command in ≥auto-threshold of sessions      | wrapper (or hook if high-cost)     |
+| R8        | File read in ≥auto-threshold of sessions         | CLAUDE.md pointer                  |
+| R9        | Grep pattern in ≥auto-threshold of sessions      | CLAUDE.md pointer                  |
+| R10-cross | ≥auto-threshold of sessions are workflow-shaped  | **skill** (project-level)          |
 
 Auto-threshold: `max(2, min(n_sessions // 4, 30))`.
 
@@ -77,6 +91,7 @@ Auto-threshold: `max(2, min(n_sessions // 4, 30))`.
 | X2 | Bash command recurring across distinct projects        | global wrapper / rtk addition   |
 | X3 | File read across distinct projects                     | global (`~/.claude`) CLAUDE.md  |
 | X4 | Grep pattern across distinct projects                  | global CLAUDE.md                |
+| X5 | Workflow-shaped sessions in ≥min-projects projects     | **global skill** (personal group / `~/.claude/skills/`) |
 
 Auto-threshold: pattern in `max(5, min(n_projects // 20, 15))` distinct projects.
 

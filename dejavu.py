@@ -263,6 +263,22 @@ def analyze_session(parsed: dict, threshold: int = 2) -> dict:
     files_read_only = set(read_files) - set(edit_files) - set(write_files)
     files_modified = set(edit_files) | set(write_files)
 
+    # --- Workflow-shape detection (skill candidate signal) ---
+    # A session is "workflow-shaped" when it shows multi-step exploration AND
+    # multi-file edits AND tool diversity. Pure repeat-the-same-command sessions
+    # are wrapper-shaped; pure read sessions are docs-shaped; this intermediate
+    # shape — explore→search→read→edit→verify across several files — is what
+    # benefits from being packaged as a Skill (a model-invokable workflow).
+    distinct_tools = len(tool_counts)
+    exploration_lengths = [len(r) for r in exploration_runs]
+    avg_exploration = sum(exploration_lengths) / len(exploration_lengths) if exploration_lengths else 0
+    has_workflow_shape = (
+        len(tool_uses) >= 15
+        and distinct_tools >= 4
+        and len(exploration_runs) >= 2
+        and len(files_modified) >= 2
+    )
+
     return {
         "meta": parsed["meta"],
         "path": parsed["path"],
@@ -280,7 +296,10 @@ def analyze_session(parsed: dict, threshold: int = 2) -> dict:
         "files_read_only": sorted(files_read_only),
         "files_modified": sorted(files_modified),
         "exploration_runs": len(exploration_runs),
-        "exploration_lengths": [len(r) for r in exploration_runs],
+        "exploration_lengths": exploration_lengths,
+        "avg_exploration_length": avg_exploration,
+        "distinct_tools": distinct_tools,
+        "has_workflow_shape": has_workflow_shape,
         "unique_bash": len(set(bash_normalized)),
         "unique_reads": len(set(read_files)),
         "unique_greps": len(set(grep_patterns)),
@@ -383,6 +402,27 @@ def recommend_from_analysis(analysis: dict) -> list[dict]:
             "rule": "R6",
         })
 
+    # R10: workflow shape — multi-step exploration with multi-file edits and
+    # tool diversity. The session looks like a packaged workflow: candidate
+    # for becoming a Skill (model-invokable, on-demand) rather than a hook
+    # (deterministic) or CLAUDE.md addition (always loaded).
+    if analysis.get("has_workflow_shape"):
+        n_files = len(analysis["files_modified"])
+        runs = analysis["exploration_runs"]
+        avg_len = analysis.get("avg_exploration_length", 0)
+        recs.append({
+            "kind": "skill",
+            "target": "multi-step workflow",
+            "reason": "session shows workflow shape (multi-step exploration + multi-file edits + tool diversity) — a recurring shape like this is a Skill candidate, not a wrapper or CLAUDE.md rule",
+            "evidence": (
+                f"{runs} exploration runs (avg len {avg_len:.1f}), "
+                f"{n_files} files modified, {analysis['distinct_tools']} distinct tools"
+            ),
+            "weight": runs * 100 + n_files * 10 + int(avg_len),
+            "priority": 3,
+            "rule": "R10",
+        })
+
     return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
 
 
@@ -417,8 +457,11 @@ def aggregate_analyses(analyses: list[dict]) -> dict:
                 grep_sessions[pat] += 1
                 seen.add(pat)
 
+    workflow_sessions = sum(1 for a in analyses if a.get("has_workflow_shape"))
+
     return {
         "n_sessions": len(analyses),
+        "workflow_sessions": workflow_sessions,
         "bash": {
             cmd: {"sessions": bash_sessions[cmd], "total": bash_total[cmd]}
             for cmd in bash_total
@@ -505,6 +548,21 @@ def recommend_from_aggregate(agg: dict, min_sessions: int | None = None) -> list
             "rule": "R9",
         })
 
+    # R10-cross: workflow-shaped sessions recurring across the project — the
+    # user keeps doing the same multi-step shape. Promote to a project-level
+    # Skill so the model can recognize and follow the pattern explicitly.
+    workflow_n = agg.get("workflow_sessions", 0)
+    if workflow_n >= max(2, threshold_sessions):
+        recs.append({
+            "kind": "skill",
+            "target": "recurring project workflow",
+            "reason": "multiple sessions show the same workflow shape — package the steps as a project Skill so the model invokes the right sequence consistently",
+            "evidence": f"{workflow_n}/{n} sessions are workflow-shaped",
+            "weight": workflow_n * 1000,
+            "priority": 2,
+            "rule": "R10-cross",
+        })
+
     return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
 
 
@@ -537,8 +595,14 @@ def cross_project_patterns(per_project_aggs: dict, min_sessions_per_project: int
                 grep_proj[pat].add(proj)
                 grep_total[pat] += info["total"]
 
+    workflow_projects = [
+        proj for proj, agg in per_project_aggs.items()
+        if agg.get("workflow_sessions", 0) >= 1
+    ]
+
     return {
         "n_projects": len(per_project_aggs),
+        "workflow_projects": sorted(workflow_projects),
         "bash": {
             cmd: {"projects": sorted(bash_proj[cmd]), "total": bash_total[cmd]}
             for cmd in bash_proj
@@ -628,6 +692,22 @@ def recommend_cross_project(cross: dict, min_projects: int | None = None) -> lis
             "rule": "X4",
         })
 
+    # X5: workflow-shaped sessions recurring in many distinct projects — the
+    # same multi-step shape across projects argues for a *global* Skill (lives
+    # in ~/.claude/skills/ or a personal group in your skills library).
+    workflow_projs = cross.get("workflow_projects", [])
+    if len(workflow_projs) >= min_projects:
+        recs.append({
+            "kind": "skill",
+            "scope": "global",
+            "target": "cross-project workflow",
+            "reason": "workflow-shaped sessions recur across many projects — package as a global Skill (personal group / ~/.claude/skills)",
+            "evidence": f"{len(workflow_projs)}/{n} projects have workflow-shaped sessions",
+            "weight": len(workflow_projs) * 1000,
+            "priority": 2,
+            "rule": "X5",
+        })
+
     return sorted(recs, key=lambda r: (r["priority"], -r.get("weight", 0)))
 
 
@@ -653,11 +733,12 @@ def format_recommendations(recs: list[dict], header: str = "", top: int = 10, he
     kind_titles = {
         "hook": "Hooks (priority 1)",
         "wrapper": "Wrappers / aliases",
+        "skill": "Skills (model-invokable workflows)",
         "claudemd": "CLAUDE.md additions",
         "docs": "Documentation",
         "codebase-map": "Codebase map",
     }
-    kind_order = ["hook", "wrapper", "claudemd", "codebase-map", "docs"]
+    kind_order = ["hook", "wrapper", "skill", "claudemd", "codebase-map", "docs"]
 
     for kind in kind_order:
         items = by_kind.get(kind)
@@ -911,12 +992,19 @@ def main():
         cross = cross_project_patterns(per_project_aggs)
         cross_recs = recommend_cross_project(cross, min_projects=args.cross_min_projects)
 
-        # Per-project highlights: top rec per project, sorted by weight
+        # Per-project highlights: top rec from each kind for each project.
+        # Surfaces hooks/wrappers/etc. that would otherwise be hidden behind a
+        # stronger claudemd rec from the same project (R8 file-reads tend to
+        # dominate by raw weight).
         highlights = []
         for proj, recs in per_project_recs.items():
-            if recs:
-                highlights.append((proj, recs[0]))
-        highlights.sort(key=lambda t: -t[1].get("weight", 0))
+            seen_kinds = set()
+            for rec in recs:  # already sorted: priority asc, weight desc
+                if rec["kind"] in seen_kinds:
+                    continue
+                seen_kinds.add(rec["kind"])
+                highlights.append((proj, rec))
+        highlights.sort(key=lambda t: (t[1].get("priority", 99), -t[1].get("weight", 0)))
         highlight_cap = args.top if args.top else len(highlights)
 
         if args.json:

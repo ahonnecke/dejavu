@@ -196,6 +196,80 @@ def test_X2_skips_already_wrapped():
 # --- Sort/priority ---
 
 
+def _workflow_shaped_uses() -> list[dict]:
+    """Synthetic tool-use sequence that satisfies has_workflow_shape:
+    >=15 uses, >=4 distinct tools, >=2 exploration runs, >=2 files modified."""
+    return [
+        # First exploration run (3 search/read)
+        _tool_use("Grep", pattern="foo"),
+        _tool_use("Glob", pattern="**/*.py"),
+        _tool_use("Read", file_path="/proj/a.py"),
+        _tool_use("Edit", file_path="/proj/a.py"),
+        _tool_use("Bash", command="pytest tests/test_a.py"),
+        # Second exploration run
+        _tool_use("Grep", pattern="bar"),
+        _tool_use("Read", file_path="/proj/b.py"),
+        _tool_use("Read", file_path="/proj/c.py"),
+        _tool_use("Edit", file_path="/proj/b.py"),
+        _tool_use("Bash", command="pytest tests/test_b.py"),
+        # Third exploration run
+        _tool_use("Grep", pattern="baz"),
+        _tool_use("Read", file_path="/proj/d.py"),
+        _tool_use("Read", file_path="/proj/e.py"),
+        _tool_use("Edit", file_path="/proj/c.py"),
+        _tool_use("Bash", command="pytest"),
+    ]
+
+
+def test_R10_workflow_shape_fires():
+    parsed = _make_parsed(_workflow_shaped_uses())
+    analysis = dejavu.analyze_session(parsed)
+    assert analysis["has_workflow_shape"]
+    recs = dejavu.recommend_from_analysis(analysis)
+    skill = next((r for r in recs if r["rule"] == "R10"), None)
+    assert skill is not None
+    assert skill["kind"] == "skill"
+
+
+def test_R10_does_not_fire_on_simple_repeat():
+    """Twenty repetitions of a single bash command is wrapper-shaped, not workflow-shaped."""
+    parsed = _make_parsed([_tool_use("Bash", command="npm test")] * 20)
+    analysis = dejavu.analyze_session(parsed)
+    assert not analysis["has_workflow_shape"]
+    recs = dejavu.recommend_from_analysis(analysis)
+    assert not any(r["rule"] == "R10" for r in recs)
+
+
+def test_R10_cross_session_workflow():
+    a1 = dejavu.analyze_session(_make_parsed(_workflow_shaped_uses()))
+    a2 = dejavu.analyze_session(_make_parsed(_workflow_shaped_uses()))
+    agg = dejavu.aggregate_analyses([a1, a2])
+    assert agg["workflow_sessions"] == 2
+    recs = dejavu.recommend_from_aggregate(agg, min_sessions=2)
+    assert any(r["rule"] == "R10-cross" and r["kind"] == "skill" for r in recs)
+
+
+def test_X5_cross_project_workflow():
+    aggs = {}
+    for i in range(5):
+        a = dejavu.analyze_session(_make_parsed(_workflow_shaped_uses()))
+        aggs[f"proj-{i}"] = dejavu.aggregate_analyses([a])
+    cross = dejavu.cross_project_patterns(aggs, min_sessions_per_project=1)
+    assert len(cross["workflow_projects"]) == 5
+    recs = dejavu.recommend_cross_project(cross, min_projects=3)
+    assert any(r["rule"] == "X5" and r["kind"] == "skill" for r in recs)
+
+
+def test_high_cost_inside_compound_command():
+    """R1 should fire when a high-cost pattern is buried inside a compound command."""
+    parsed = _make_parsed([
+        _tool_use("Bash", command="make clean && rm -rf /tmp/build && echo done"),
+        _tool_use("Bash", command="make clean && rm -rf /tmp/build && echo done"),
+    ])
+    recs = dejavu.recommend_from_analysis(dejavu.analyze_session(parsed))
+    assert "R1" in _rule_ids(recs)
+
+
 def test_recs_sorted_priority_then_weight():
     parsed = _make_parsed([
         _tool_use("Bash", command="rm -rf /a"),
