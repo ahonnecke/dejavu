@@ -267,7 +267,30 @@ def test_high_cost_inside_compound_command():
         _tool_use("Bash", command="make clean && rm -rf /tmp/build && echo done"),
     ])
     recs = dejavu.recommend_from_analysis(dejavu.analyze_session(parsed))
-    assert "R1" in _rule_ids(recs)
+    r1 = next((r for r in recs if r["rule"] == "R1"), None)
+    assert r1 is not None
+    # Target is the dangerous fragment, not the whole compound soup
+    assert r1["target"] == "rm -rf /tmp/build"
+
+
+def test_R2_skips_make_targets():
+    """make X is itself a wrapper — don't recommend wrapping a wrapper."""
+    parsed = _make_parsed([_tool_use("Bash", command="make test")] * 5)
+    recs = dejavu.recommend_from_analysis(dejavu.analyze_session(parsed))
+    assert "R2" not in _rule_ids(recs)
+
+
+def test_R2_skips_npm_run():
+    parsed = _make_parsed([_tool_use("Bash", command="npm run build")] * 5)
+    recs = dejavu.recommend_from_analysis(dejavu.analyze_session(parsed))
+    assert "R2" not in _rule_ids(recs)
+
+
+def test_R2_does_not_skip_npm_install():
+    """npm install IS a legit wrapper candidate — don't filter it."""
+    parsed = _make_parsed([_tool_use("Bash", command="npm install")] * 5)
+    recs = dejavu.recommend_from_analysis(dejavu.analyze_session(parsed))
+    assert "R2" in _rule_ids(recs)
 
 
 def test_recs_sorted_priority_then_weight():

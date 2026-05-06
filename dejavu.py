@@ -62,6 +62,26 @@ def is_high_cost_bash(cmd: str) -> bool:
     return any(p.search(cmd) for p in HIGH_COST_BASH_PATTERNS)
 
 
+def matched_high_cost_fragment(cmd: str) -> str | None:
+    """If any high-cost pattern matches, return just the dangerous fragment.
+
+    For compound commands like `make clean && rm -rf /tmp/x && echo done`, this
+    returns `rm -rf /tmp/x` — the actionable substring, not the whole compound
+    soup. Span is from the regex match start to the next shell-level separator
+    after the match end (&&, ||, ;, newline). The pipe `|` is not a separator
+    here because curl-pipe-sh patterns capture across the pipe.
+    """
+    for pattern in HIGH_COST_BASH_PATTERNS:
+        m = pattern.search(cmd)
+        if not m:
+            continue
+        after = cmd[m.end():]
+        sep = re.search(r"\s*(?:&&|\|\||;|\n)", after)
+        end = m.end() + sep.start() if sep else len(cmd)
+        return cmd[m.start():end].strip()
+    return None
+
+
 def normalize_cmd(cmd: str) -> str:
     """Normalize a bash command for grouping.
 
@@ -89,15 +109,43 @@ def normalize_cmd(cmd: str) -> str:
     return cmd
 
 
-def is_already_wrapped(cmd: str) -> bool:
-    """True if the command is an invocation of a user script (absolute path / ./).
+TASK_RUNNER_VERBS = {"make", "just", "rake"}
+PACKAGE_RUN_VERBS = {"npm", "pnpm", "yarn", "bun"}
+# Bare orientation commands — Claude inspecting the workspace, not running real
+# work. Recommending a wrapper for `ls` or `pwd` is silly.
+ORIENTATION_VERBS = {"ls", "pwd", "cd", "which", "echo", "type"}
 
-    These are already wrapped — recommending another wrapper is noise.
+
+def is_already_wrapped(cmd: str) -> bool:
+    """True if a wrapper recommendation for `cmd` would be unhelpful.
+
+    Four flavors:
+    1. Path invocations (`/usr/bin/foo`, `./run.sh`, `~/bin/x`, anything in `/bin/`)
+       — the script IS the wrapper.
+    2. Project task runners (`make foo`, `just bar`, `rake test`) — the target
+       names ARE the wrappers.
+    3. Package-manager run commands (`npm run X`, `pnpm run X`, etc.) — script
+       targets defined in package.json. Bare `npm install` is NOT filtered.
+    4. Bare orientation commands (`ls`, `pwd`, `cd /tmp`, `which foo`) when the
+       command has no shell separator — these are inspection, not real work.
+       Compounds like `cd ~/.doom.d && git log` are still wrapper candidates.
     """
-    first = cmd.split(None, 1)[0] if cmd else ""
-    if not first:
+    if not cmd:
         return False
-    return first.startswith(("/", "./", "~/")) or "/bin/" in first
+    tokens = cmd.split()
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first.startswith(("/", "./", "~/")) or "/bin/" in first:
+        return True
+    if first in TASK_RUNNER_VERBS:
+        return True
+    if first in PACKAGE_RUN_VERBS and len(tokens) >= 2 and tokens[1] == "run":
+        return True
+    has_separator = any(sep in cmd for sep in ("&&", "||", ";", "|"))
+    if first in ORIENTATION_VERBS and not has_separator:
+        return True
+    return False
 
 
 def project_key_from_path(project_path: str) -> str:
@@ -319,9 +367,10 @@ def recommend_from_analysis(analysis: dict) -> list[dict]:
     # R1: high-cost bash, even count >= 2 is too many
     for cmd, count in analysis["repeated_bash"].items():
         if is_high_cost_bash(cmd):
+            fragment = matched_high_cost_fragment(cmd) or cmd
             recs.append({
                 "kind": "hook",
-                "target": cmd,
+                "target": fragment,
                 "reason": "high-blast-radius command — even one mistake is expensive",
                 "evidence": f"{count}x in this session",
                 "weight": count * 100,
@@ -500,9 +549,10 @@ def recommend_from_aggregate(agg: dict, min_sessions: int | None = None) -> list
         evidence = f"{info['total']}x across {info['sessions']}/{n} sessions"
         weight = info["sessions"] * 1000 + info["total"]
         if is_high_cost_bash(cmd):
+            fragment = matched_high_cost_fragment(cmd) or cmd
             recs.append({
                 "kind": "hook",
-                "target": cmd,
+                "target": fragment,
                 "reason": "high-blast-radius command recurring across sessions",
                 "evidence": evidence,
                 "weight": weight + 100000,
@@ -640,10 +690,11 @@ def recommend_cross_project(cross: dict, min_projects: int | None = None) -> lis
         evidence = f"{info['total']}x across {n_proj}/{n} projects"
         weight = n_proj * 1000 + info["total"]
         if is_high_cost_bash(cmd):
+            fragment = matched_high_cost_fragment(cmd) or cmd
             recs.append({
                 "kind": "hook",
                 "scope": "global",
-                "target": cmd,
+                "target": fragment,
                 "reason": "high-blast-radius command recurring across multiple projects",
                 "evidence": evidence,
                 "weight": weight + 100000,
